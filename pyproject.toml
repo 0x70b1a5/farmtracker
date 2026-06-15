@@ -1,0 +1,15 @@
+[project]
+name = "farmtracker"
+version = "0.1.0"
+description = "A Discord bot for small-scale farm chore logistics, reminders, and family gamification."
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "discord.py>=2.4",
+    "python-dotenv>=1.0",
+    "tzdata>=2024.1",
+]
+
+# Intentionally no [build-system]: this is an application, not a library.
+# `uv` will just manage the virtualenv + dependencies. Run it with:
+#     uv run python -m farmtracker

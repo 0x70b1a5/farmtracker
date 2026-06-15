@@ -1,0 +1,18 @@
+# Secrets & local state
+.env
+data/
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# uv
+.uv/
+
+# OS / editor
+.DS_Store
+*.swp
+.idea/
+.vscode/
