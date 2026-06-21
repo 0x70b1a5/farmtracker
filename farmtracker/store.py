@@ -33,6 +33,7 @@ EMPTY: dict[str, Any] = {
     "tasks": {},
     "messages": {},
     "undo": {},
+    "requeue": {},  # completed-post message id -> {task_id, before, guild_id, channel_id}
     "snooze_panels": {},  # panel message id -> {task_id, anchor_id, unit, brief}
 }
 

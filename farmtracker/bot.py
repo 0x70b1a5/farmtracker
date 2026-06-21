@@ -17,6 +17,8 @@ Lifecycle of a task occurrence
                       (Deleting an entire recurring task is /deletetask.)
      ↩️  undo      -> reverse the most recent ✅/⏩/❌ on that occurrence. The
                       bot adds this button right after one of those actions.
+     🔄  requeue   -> appears on a ✅-completed post; re-fires the chore right
+                      now (a fresh occurrence) without waiting for its next slot.
 
 Everything is keyed off ``store["messages"][message_id] -> task_id`` so that
 reactions keep working across restarts, and the persisted ``remind_at`` means
@@ -56,6 +58,7 @@ from .models import (
     EMOJI_DONE,
     EMOJI_FFWD,
     EMOJI_INFO,
+    EMOJI_REQUEUE,
     EMOJI_SNOOZE_DAYS,
     EMOJI_SNOOZE_HOURS,
     EMOJI_UNDO,
@@ -317,6 +320,12 @@ async def on_raw_reaction_add(payload: discord.RawReactionActionEvent) -> None:
         await _handle_undo(payload, channel)
         return
 
+    # Requeue (🔄) sits on a ✅-completed post, which — like an undone one — has
+    # been de-registered from "messages", so it is keyed off its own table.
+    if key == emoji_key(EMOJI_REQUEUE):
+        await _handle_requeue(payload, channel)
+        return
+
     snap = await store.snapshot()
     if str(payload.message_id) in snap["snooze_panels"]:
         await _handle_snooze_panel(payload, channel)
@@ -554,6 +563,7 @@ async def _handle_done(tid, task, cfg, tz, channel, payload, mention, display) -
         await finalize_messages(channel, message_ids, status)
         if message_ids:
             await _arm_undo("done", tid, before, message_ids[-1], channel, completion_id=completion_id)
+            await _arm_requeue(tid, before, message_ids[-1], channel, task["guild_id"])
 
 
 async def _handle_skip_or_delete(tid, task, tz, channel, mention) -> None:
@@ -670,11 +680,12 @@ async def _restore_anchor(
         await pm.clear_reactions()  # needs Manage Messages; best effort
     except discord.HTTPException:
         pass
-    if bot.user:  # ensure our ↩️ is gone even without Manage Messages
-        try:
-            await pm.remove_reaction(EMOJI_UNDO, bot.user)
-        except discord.HTTPException:
-            pass
+    if bot.user:  # ensure our ↩️/🔄 are gone even without Manage Messages
+        for emoji in (EMOJI_UNDO, EMOJI_REQUEUE):
+            try:
+                await pm.remove_reaction(emoji, bot.user)
+            except discord.HTTPException:
+                pass
     try:
         await add_task_reactions(pm, task)
     except discord.HTTPException:
@@ -728,6 +739,9 @@ async def _handle_undo(
         else:
             outcome = "refused"
         data["undo"].pop(str(payload.message_id), None)
+        # Undoing a ✅ turns its post back into a live occurrence, so any 🔄
+        # requeue we armed on that same post no longer applies.
+        data["requeue"].pop(str(payload.message_id), None)
 
     if outcome == "ok":
         if action == "done" and completion_id:
@@ -735,6 +749,131 @@ async def _handle_undo(
         await _restore_anchor(channel, payload.message_id, before)
     elif outcome == "refused":
         await _disarm_undo_button(channel, payload.message_id)
+
+
+# ---------------------------------------------------------------------------
+# Requeue (🔄)
+# ---------------------------------------------------------------------------
+# A ✅-completed post keeps a 🔄 button so an occurrence can be re-run on the
+# spot — e.g. you marked "water the animals" done, then notice the trough is dry
+# again. Pressing it fires a *fresh* occurrence right now instead of waiting for
+# the next scheduled slot; finishing that occurrence rolls the recurrence to its
+# normal next slot exactly as usual (the schedule re-pins to time_of_day, so it
+# doesn't drift). Like ↩️, only the most recent completed post per task carries a
+# live 🔄, and the table survives restarts.
+async def _arm_requeue(
+    tid: str,
+    before: Optional[dict],
+    anchor_id: int,
+    channel: discord.abc.Messageable,
+    guild_id: int,
+) -> None:
+    """Add the 🔄 button to a just-completed post and remember how to re-fire the
+    task from it, retiring any 🔄 left on this task's older completed posts."""
+    if before is None:
+        return
+    stale: list[int] = []
+    async with store.txn() as data:
+        for mid, rec in list(data["requeue"].items()):
+            if rec.get("task_id") == tid and str(mid) != str(anchor_id):
+                data["requeue"].pop(mid, None)
+                stale.append(int(mid))
+        data["requeue"][str(anchor_id)] = {
+            "task_id": tid,
+            "before": before,  # lets a completed one-off be recreated and re-run
+            "guild_id": guild_id,
+            "channel_id": getattr(channel, "id", None),
+        }
+    try:
+        await channel.get_partial_message(anchor_id).add_reaction(EMOJI_REQUEUE)
+    except discord.HTTPException:
+        pass
+    if bot.user:  # tidy now-dead 🔄 buttons left on this task's older posts
+        for mid in stale:
+            try:
+                await channel.get_partial_message(mid).remove_reaction(EMOJI_REQUEUE, bot.user)
+            except discord.HTTPException:
+                pass
+
+
+async def _handle_requeue(
+    payload: discord.RawReactionActionEvent, channel: discord.abc.Messageable
+) -> None:
+    snap = await store.snapshot()
+    if str(payload.message_id) not in snap["requeue"]:
+        return  # a 🔄 on something we don't track — ignore
+
+    member = payload.member
+    mention = member.mention if member else f"<@{payload.user_id}>"
+
+    outcome = None  # "fired" | "busy" | "gone"
+    tid = cfg = None
+    async with store.txn() as data:
+        rec = data["requeue"].get(str(payload.message_id))
+        if not rec:
+            return  # a concurrent 🔄 beat us to it
+        tid = rec["task_id"]
+        cfg = guild_config(snap, rec["guild_id"])
+        if not config_ready(cfg):
+            return
+        live = data["tasks"].get(tid)
+        if live is not None and live.get("pending"):
+            outcome = "busy"  # an occurrence is already live — finish that one
+        elif live is not None:
+            live["next_due"] = to_iso(now_utc())  # fire on the spot below
+            outcome = "fired"
+        elif rec.get("before") is not None:
+            # The task is gone (a completed one-off, or it was deleted): rebuild
+            # it from the saved snapshot as a fresh, due-now occurrence.
+            restored = json.loads(json.dumps(rec["before"]))
+            restored["pending"] = None
+            restored["next_due"] = to_iso(now_utc())
+            data["tasks"][tid] = restored
+            outcome = "fired"
+        else:
+            outcome = "gone"
+        if outcome == "fired":
+            # This completed post is spent; the fresh occurrence carries its own
+            # buttons. Drop the record so a second tap can't double-fire.
+            data["requeue"].pop(str(payload.message_id), None)
+
+    pm = channel.get_partial_message(payload.message_id)
+    if outcome == "fired":
+        await fire_task(tid, channel, cfg)
+        # Tidy the spent 🔄 off the old completed post (both ours and theirs) and
+        # confirm right where they tapped — the fresh post may be far down.
+        await _remove_user_reaction(pm, payload)
+        if bot.user:
+            try:
+                await pm.remove_reaction(EMOJI_REQUEUE, bot.user)
+            except discord.HTTPException:
+                pass
+        try:
+            await channel.send(
+                f"🔄 Re-queued by {mention} — posted it again below.",
+                reference=pm,
+                allowed_mentions=NO_PINGS,
+            )
+        except discord.HTTPException:
+            pass
+    elif outcome == "busy":
+        # Leave the button so they can requeue once the live one is resolved.
+        await _remove_user_reaction(pm, payload)
+        try:
+            await channel.send(
+                f"🔄 {mention}, that chore is already queued — finish the active "
+                "reminder above first.",
+                reference=pm,
+                allowed_mentions=NO_PINGS,
+            )
+        except discord.HTTPException:
+            pass
+    else:  # gone
+        if bot.user:
+            try:
+                await pm.remove_reaction(EMOJI_REQUEUE, bot.user)
+            except discord.HTTPException:
+                pass
 
 
 # ---------------------------------------------------------------------------
@@ -1058,6 +1197,9 @@ async def deletetask(interaction: discord.Interaction, task: str) -> None:
                 for mid, rec in list(data["undo"].items()):
                     if rec.get("task_id") == tid:
                         data["undo"].pop(mid, None)
+                for mid, rec in list(data["requeue"].items()):
+                    if rec.get("task_id") == tid:
+                        data["requeue"].pop(mid, None)
                 panels = _take_task_panels(data, tid)
                 removed = data["tasks"].pop(tid, None)
     await _delete_panels(panels)
@@ -1264,7 +1406,8 @@ async def farmhelp(interaction: discord.Interaction) -> None:
             "⏩ **Snooze** — opens a number-pad panel; pick hours or days\n"
             "ℹ️ **Info** — shows the longer description, if any\n"
             "❌ **Skip** — skips just this time (recurring) or cancels (one-off)\n"
-            "↩️ **Undo** — appears after ✅/⏩/❌ to reverse it"
+            "↩️ **Undo** — appears after ✅/⏩/❌ to reverse it\n"
+            "🔄 **Requeue** — appears on a completed chore; re-posts it right now"
         ),
         inline=False,
     )

@@ -235,6 +235,7 @@ async def test_void_completion() -> None:
         store = Store(path, pathlib.Path(d) / "log.jsonl")
         store.load()
         assert "undo" in store.data, "store should grow an 'undo' section"
+        assert "requeue" in store.data, "store should grow a 'requeue' section"
 
         await store.log_completion({"id": "aaa", "user_id": 1})
         await store.log_completion({"id": "bbb", "user_id": 2})
@@ -467,8 +468,9 @@ async def test_legacy_migration() -> None:
         ch = FakeChannel()
         bot.bot.get_channel = lambda cid: ch  # type: ignore[assignment]
 
-        # load() backfills the new top-level section the old file lacked.
+        # load() backfills the new top-level sections the old file lacked.
         assert "snooze_panels" in st.data
+        assert "requeue" in st.data
 
         # recurrence_of reads the legacy fields as the equivalent rule.
         assert m.recurrence_of(legacy["tasks"]["leg1"])["freq"] == "days"
@@ -519,6 +521,117 @@ async def test_legacy_migration() -> None:
         assert t["freq"] == "weekly" and t["weekdays"] == [0, 3] and t["time_of_day"] == "07:30"
 
 
+async def test_requeue() -> None:
+    """A ✅-completed post grows a 🔄 button; tapping it re-fires the chore right
+    now as a fresh occurrence, rolls on normally when finished, and declines
+    while another occurrence is already live."""
+    import farmtracker.bot as bot
+
+    with tempfile.TemporaryDirectory() as d:
+        st = Store(pathlib.Path(d) / "store.json", pathlib.Path(d) / "log.jsonl")
+        st.load()
+        bot.store = st  # handlers read the module global at call time
+        ch = FakeChannel()
+        bot.bot.get_channel = lambda cid: ch  # type: ignore[assignment]
+
+        tz = ZoneInfo("Europe/Berlin")
+        now = m.now_utc()
+        tod = now.astimezone(tz).strftime("%H:%M")
+        cfg = {"channel_id": 999, "timezone": "Europe/Berlin", "reminder_role_id": None}
+        tid = "water"
+        task = {
+            "id": tid, "guild_id": 1, "brief": "Water the animals", "description": None,
+            "recurring": True, "freq": "days", "interval_days": 1, "weekdays": [],
+            "monthdays": [], "time_of_day": tod,
+            "next_due": m.to_iso(now - dt.timedelta(seconds=1)),  # already due -> fires
+            "created_by": 1, "created_at": m.to_iso(now), "pending": None,
+        }
+        async with st.txn() as data:
+            data["configs"]["1"] = cfg
+            data["tasks"][tid] = task
+
+        # Fire + ✅ complete -> the completed post should carry a 🔄.
+        await bot.fire_task(tid, ch, cfg)
+        posted = (await st.snapshot())["tasks"][tid]["pending"]["message_ids"][-1]
+        await bot.on_raw_reaction_add(FakePayload(posted, "✅", member=FakeMember(42, "Pat")))
+        snap = await st.snapshot()
+        assert snap["tasks"][tid]["pending"] is None
+        assert str(posted) in snap["requeue"], "completing arms a requeue on the post"
+        assert (posted, "🔄") in ch.added, "🔄 button added to the completed post"
+        assert len(st.read_completions()) == 1
+
+        # 🔄 re-fires it now as a fresh occurrence; the spent record is dropped.
+        await bot.on_raw_reaction_add(FakePayload(posted, "🔄", member=FakeMember(7, "Sam")))
+        snap = await st.snapshot()
+        assert str(posted) not in snap["requeue"], "the spent requeue record is dropped"
+        p = snap["tasks"][tid]["pending"]
+        assert p is not None, "requeue fires a fresh, live occurrence"
+        fresh = p["message_ids"][-1]
+        assert fresh != posted, "a brand-new post, not the completed one"
+
+        # Finishing the re-run rolls the daily recurrence on to tomorrow's slot
+        # (re-pinned to its time-of-day, so no drift) and counts again.
+        await bot.on_raw_reaction_add(FakePayload(fresh, "✅", member=FakeMember(7, "Sam")))
+        snap = await st.snapshot()
+        assert snap["tasks"][tid]["pending"] is None
+        nd = m.from_iso(snap["tasks"][tid]["next_due"]).astimezone(tz)
+        assert nd.strftime("%H:%M") == tod and m.from_iso(snap["tasks"][tid]["next_due"]) > now
+        assert len(st.read_completions()) == 2, "the re-run also counts on the leaderboard"
+
+        # With another occurrence live, 🔄 on the re-run's completed post declines
+        # rather than double-firing.
+        fresh_post = int(next(iter(snap["requeue"])))  # armed on the re-run's post
+        async with st.txn() as data:  # simulate the next cycle having fired
+            data["tasks"][tid]["next_due"] = m.to_iso(now - dt.timedelta(seconds=1))
+        await bot.fire_task(tid, ch, cfg)
+        live_mid = (await st.snapshot())["tasks"][tid]["pending"]["message_ids"][-1]
+        await bot.on_raw_reaction_add(FakePayload(fresh_post, "🔄", member=FakeMember(7, "Sam")))
+        snap = await st.snapshot()
+        assert snap["tasks"][tid]["pending"]["message_ids"][-1] == live_mid, "no double-fire while busy"
+        assert str(fresh_post) in snap["requeue"], "the button stays for later"
+        assert any("already queued" in (msg.content or "") for msg in ch.msgs.values())
+
+
+async def test_requeue_oneoff() -> None:
+    """A completed one-off is gone from the store; 🔄 rebuilds it from the saved
+    snapshot and re-fires it."""
+    import farmtracker.bot as bot
+
+    with tempfile.TemporaryDirectory() as d:
+        st = Store(pathlib.Path(d) / "store.json", pathlib.Path(d) / "log.jsonl")
+        st.load()
+        bot.store = st
+        ch = FakeChannel()
+        bot.bot.get_channel = lambda cid: ch  # type: ignore[assignment]
+
+        now = m.now_utc()
+        cfg = {"channel_id": 999, "timezone": "Europe/Berlin", "reminder_role_id": None}
+        tid = "vet"
+        task = {
+            "id": tid, "guild_id": 1, "brief": "Move the sheep", "description": None,
+            "recurring": False, "freq": "once", "interval_days": 0, "weekdays": [],
+            "monthdays": [], "time_of_day": None,
+            "next_due": m.to_iso(now - dt.timedelta(seconds=1)),
+            "created_by": 1, "created_at": m.to_iso(now), "pending": None,
+        }
+        async with st.txn() as data:
+            data["configs"]["1"] = cfg
+            data["tasks"][tid] = task
+
+        await bot.fire_task(tid, ch, cfg)
+        posted = (await st.snapshot())["tasks"][tid]["pending"]["message_ids"][-1]
+        await bot.on_raw_reaction_add(FakePayload(posted, "✅", member=FakeMember(42, "Pat")))
+        snap = await st.snapshot()
+        assert tid not in snap["tasks"], "a completed one-off is removed"
+        assert str(posted) in snap["requeue"], "but it still offers a requeue"
+
+        await bot.on_raw_reaction_add(FakePayload(posted, "🔄", member=FakeMember(42, "Pat")))
+        snap = await st.snapshot()
+        assert tid in snap["tasks"], "requeue rebuilt the one-off"
+        assert snap["tasks"][tid]["pending"] is not None, "and re-fired it"
+        assert snap["tasks"][tid]["recurring"] is False
+
+
 def main() -> None:
     test_emoji_key()
     test_time_parsing()
@@ -536,6 +649,8 @@ def main() -> None:
     asyncio.run(test_store())
     asyncio.run(test_lifecycle_and_snooze())
     asyncio.run(test_legacy_migration())
+    asyncio.run(test_requeue())
+    asyncio.run(test_requeue_oneoff())
     print("✅ all smoke tests passed")
 
 

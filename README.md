@@ -30,6 +30,7 @@ family chores.
   | ℹ️ | **Info** — replies with the full description. *(Only shown if the task has one.)* |
   | ❌ | **Skip** — skips just *this* occurrence of a recurring task (it returns next cycle); deletes a one-off. To remove a recurring task entirely, use `/deletetask`. |
   | ↩️ | **Undo** — appears right after a ✅/⏩/❌ and reverses it: a completion is un-logged (so it leaves the leaderboard too), a snooze is rolled back, and a skip/delete is restored. Survives restarts; only the most recent action on an occurrence is undoable, and only until that chore next comes due. |
+  | 🔄 | **Requeue** — appears on a ✅-completed post; re-fires that chore **right now** as a fresh occurrence (handy when, say, the water trough is empty again an hour later) without waiting for its next scheduled slot. Finishing the re-run rolls the recurrence on to its normal next slot. Survives restarts; the most recent completed post per task carries the button. |
 - If nobody completes or snoozes within the hour, the bot **re-posts hourly**
   until the chore is done (optionally pinging a role).
 - Everything survives restarts: due times, pending occurrences, snooze timers,
@@ -184,6 +185,14 @@ farmtracker/
   guarded so a stale ↩️ can't clobber a newer occurrence, and undoing a ✅ also
   voids that entry in the completion log. Only the latest action per occurrence
   is undoable.
+- **Requeue** keeps a 🔄 on the ✅-completed post (in a persisted `requeue` table,
+  keyed by that post's id). Tapping it fires a *fresh* occurrence right away —
+  for a recurring task by setting `next_due` to now, for a completed one-off by
+  rebuilding it from the saved snapshot — then leaves the recurrence to roll on
+  to its normal next slot when the re-run is finished (it re-pins to
+  `time_of_day`, so the schedule never drifts). If an occurrence is already live
+  it declines (finish that one first). Only the most recent completed post per
+  task carries the button.
 - Editing a task's schedule recomputes its next post immediately — unless a
   reminder is **live right now**, in which case that occurrence is left alone and
   the new schedule takes effect from the next cycle.

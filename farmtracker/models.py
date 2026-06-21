@@ -68,6 +68,7 @@ EMOJI_FFWD = "⏩"
 EMOJI_INFO = "ℹ️"
 EMOJI_DELETE = "❌"
 EMOJI_UNDO = "↩️"  # appears after a ✅/⏩/❌ action so it can be reverted
+EMOJI_REQUEUE = "🔄"  # appears on a ✅-completed post to re-fire the chore now
 
 # Snooze "numpad": tapping ⏩ opens a *separate* panel message that self-reacts
 # with these, so the task post itself stays uncluttered. Pick a number; toggle
