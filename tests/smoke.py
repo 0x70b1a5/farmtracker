@@ -59,6 +59,40 @@ def test_first_due() -> None:
     assert (due2.hour, due2.minute) == (10, 0)
 
 
+def test_first_due_now_fires_immediately() -> None:
+    # The "now" bug: a recurring task created mid-minute reduces "now" to its
+    # HH:MM slot (seconds dropped), so today's slot is a few seconds in the past
+    # the instant it's computed. It must still fire on the next tick, not skip a
+    # full day. The current minute and the one just before it both count as now.
+    tz = ZoneInfo("Europe/Berlin")
+    now = dt.datetime(2026, 6, 14, 9, 5, 45, tzinfo=tz).astimezone(UTC)  # 09:05:45
+    # "now" -> slot 09:05 today; with seconds elapsed it's just-passed -> fire now.
+    same = m.compute_first_due(now, tz, "09:05")
+    assert same <= now and same.astimezone(tz).hour == 9 and same.astimezone(tz).minute == 5
+    # the previous minute (T-1m rounding) also counts as now.
+    prev = m.compute_first_due(now, tz, "09:04")
+    assert prev <= now and prev.astimezone(tz).minute == 4
+    # but a genuinely older slot (>1 min past) still rolls to tomorrow.
+    old = m.compute_first_due(now, tz, "09:03").astimezone(tz)
+    assert (old.date() - now.astimezone(tz).date()).days == 1 and old.minute == 3
+    # a still-future slot today is untouched.
+    later = m.compute_first_due(now, tz, "18:00").astimezone(tz)
+    assert later.date() == now.astimezone(tz).date() and later.hour == 18
+
+
+def test_schedule_now_recurring_fires_today() -> None:
+    # End-to-end: `at:"now"` through the command's scheduler-field builder must
+    # land its first fire at/just-before now for every recurrence kind, so the
+    # 30s scheduler loop posts it on the next tick rather than 24h+ later.
+    from farmtracker.bot.commands import schedule_from_rule
+    tz = ZoneInfo("Europe/Berlin")
+    now = dt.datetime(2026, 6, 19, 13, 5, 30, tzinfo=tz).astimezone(UTC)  # Friday 13:05:30
+    for repeat in ("daily", "every 2 days", "fri", "monthly"):
+        sched = schedule_from_rule(m.parse_repeat(repeat), "now", tz, now, at_given=True)
+        assert sched["recurring"] and sched["time_of_day"] == "13:05"
+        assert sched["next_due"] <= now, f"{repeat!r} created 'now' should fire immediately"
+
+
 def test_roll_forward_skips_backlog() -> None:
     tz = ZoneInfo("Europe/Berlin")
     prev = dt.datetime(2026, 6, 10, 8, 0, tzinfo=tz).astimezone(UTC)  # due 5 days ago
@@ -1824,6 +1858,8 @@ def main() -> None:
     test_describe_repeat()
     test_recurrence_dispatch()
     test_first_due()
+    test_first_due_now_fires_immediately()
+    test_schedule_now_recurring_fires_today()
     test_roll_forward_skips_backlog()
     test_roll_forward_dst()
     test_oneoff_parse()

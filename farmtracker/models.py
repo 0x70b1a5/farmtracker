@@ -160,13 +160,31 @@ def new_id() -> str:
 
 
 # --- Recurrence math ---------------------------------------------------------
+# A brand-new task created "now" should fire on the very next tick, not a full
+# cycle later. Its wall-clock slot is minute-granular (HH:MM) while ``now``
+# carries seconds, so today's slot is already a few seconds in the past the
+# instant it's computed — without slack, "now" (or the current clock minute, or
+# a T-1m rounding artifact) would skip to the next slot a day/week/month away.
+# We treat any slot at or after the start of the previous minute as "due now";
+# anything older rolls forward as usual. The anchor is the instant just *before*
+# that boundary, so the strict ``cand > anchor`` tests below include the
+# boundary minute itself.
+_FIRST_FIRE_SLACK = dt.timedelta(minutes=1)
+
+
+def _first_fire_anchor(now: dt.datetime) -> dt.datetime:
+    """Exclusive lower bound for a brand-new task's first fire (see note above)."""
+    return now.replace(second=0, microsecond=0) - _FIRST_FIRE_SLACK - dt.timedelta(microseconds=1)
+
+
 def compute_first_due(now: dt.datetime, tz: ZoneInfo, time_of_day: str) -> dt.datetime:
-    """First fire for a brand-new recurring task: today at HH:MM if that is
-    still in the future, otherwise tomorrow at HH:MM."""
+    """First fire for a brand-new recurring task: today at HH:MM if that slot is
+    still ahead — or within the current/just-passed minute, so a task created
+    "now" fires immediately — otherwise tomorrow at HH:MM."""
     h, mi = parse_hhmm(time_of_day)
     local_now = now.astimezone(tz)
     cand = local_now.replace(hour=h, minute=mi, second=0, microsecond=0)
-    if cand <= local_now:
+    if cand <= _first_fire_anchor(now):
         cand = cand + dt.timedelta(days=1)
     return cand.astimezone(UTC)
 
@@ -534,15 +552,17 @@ def _next_monthly(monthdays: list[int], tz: ZoneInfo, h: int, mi: int,
 
 
 def first_due(rule: dict, tz: ZoneInfo, now: dt.datetime) -> dt.datetime:
-    """First fire for a brand-new recurring task (today's slot if still ahead)."""
+    """First fire for a brand-new recurring task (today's slot if still ahead, or
+    the current/just-passed minute so a task created "now" fires at once)."""
     tod = rule["time_of_day"]
     h, mi = parse_hhmm(tod)
     if rule["freq"] == "days":
         return compute_first_due(now, tz, tod)
+    after = _first_fire_anchor(now)  # let the current minute's slot count as "now"
     if rule["freq"] == "weekly":
-        return _next_weekly(rule["weekdays"], tz, h, mi, now)
+        return _next_weekly(rule["weekdays"], tz, h, mi, after)
     if rule["freq"] == "monthly":
-        return _next_monthly(rule["monthdays"], tz, h, mi, now)
+        return _next_monthly(rule["monthdays"], tz, h, mi, after)
     raise ValueError(f"{rule['freq']} is not a recurring rule")
 
 
