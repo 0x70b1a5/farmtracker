@@ -24,6 +24,9 @@ Task dict schema
     "created_by":   int,
     "created_at":   str,            # ISO-8601 UTC
     "pending":      dict | None,    # the in-flight occurrence, or None
+    "nag_count":    int,            # lifetime count of reminders ever posted for
+                                    #   this chore (never reset; shown in /listtasks).
+                                    #   Absent on tasks created before it existed.
 }
 
 Recurrence (``freq``)

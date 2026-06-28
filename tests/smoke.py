@@ -284,15 +284,26 @@ class FakeMessage:
         self.channel = channel
         self.content = None
         self.view = None
+        # The live set of reactions on this message (emoji string -> present),
+        # so a test can verify a member's fun reaction survives a close while our
+        # functional buttons are stripped.
+        self.reactions: set[str] = set()
 
     async def add_reaction(self, emoji) -> None:
         self.channel.added.append((self.id, str(emoji)))
+        self.reactions.add(str(emoji))
 
     async def remove_reaction(self, emoji, user) -> None:
-        pass
+        self.reactions.discard(str(emoji))
+
+    async def clear_reaction(self, emoji) -> None:
+        # Discord's clear_reaction(emoji) sweeps everyone's copy of that one emoji.
+        self.channel.cleared_emoji.append((self.id, str(emoji)))
+        self.reactions.discard(str(emoji))
 
     async def clear_reactions(self) -> None:
         self.channel.cleared.append(self.id)
+        self.reactions.clear()
 
     async def edit(self, content=None, **kw) -> None:  # absorbs view=/allowed_mentions=
         self.content = content
@@ -310,6 +321,7 @@ class FakeChannel:
         self.added: list = []
         self.deleted: list = []
         self.cleared: list = []
+        self.cleared_emoji: list = []
         self._next = 1000
 
     async def send(self, content=None, allowed_mentions=None, **kw) -> FakeMessage:
@@ -354,13 +366,16 @@ class FakeResponse:
     def __init__(self) -> None:
         self.content = None
         self.embed = None
+        self.embeds = None
         self.ephemeral = None
         self.view = None
         self._done = False
 
     async def send_message(self, content=None, *, ephemeral=False, embed=None,
-                           allowed_mentions=None) -> None:
-        self.content, self.embed, self.ephemeral, self._done = content, embed, ephemeral, True
+                           embeds=None, view=None, allowed_mentions=None) -> None:
+        self.content, self.ephemeral, self.view, self._done = content, ephemeral, view, True
+        self.embeds = embeds
+        self.embed = embed if embed is not None else (embeds[0] if embeds else None)
 
     async def edit_message(self, content=None, *, view=None, allowed_mentions=None) -> None:
         self.content, self.view, self._done = content, view, True
@@ -432,7 +447,10 @@ async def test_pitchin_lifecycle() -> None:
         recs = st.read_completions()
         assert len(recs) == 1 and recs[0]["user_id"] == 42 and recs[0]["points"] == 1
         assert recs[0]["kind"] == "pitchin"
-        assert "pitched in!" in ch.msgs[mid].content and mid in ch.cleared
+        # Closing strips our ✅/🏁 buttons (not via the all-nuking clear_reactions).
+        assert "pitched in!" in ch.msgs[mid].content
+        assert (mid, "✅") in ch.cleared_emoji and (mid, m.EMOJI_END) in ch.cleared_emoji
+        assert mid not in ch.cleared
 
 
 async def test_pitchin_cap_and_points() -> None:
@@ -1556,6 +1574,168 @@ def test_zone_pick() -> None:
     assert t["zone_emoji"] == T.zone_emoji(zk) and t["zone_name"] == T.zone_label(zk)
 
 
+async def test_finalize_keeps_fun_reactions() -> None:
+    """Closing a pitch-in takes down our ✅/🏁 buttons but leaves a member's fun
+    reaction (a 😄) in place — the old clear_reactions() would have wiped it."""
+    with tempfile.TemporaryDirectory() as d:
+        bot, st, ch = await _game_setup(d)
+        now = m.now_utc()
+        pid, msg = await bot.post_pitchin(
+            ch, guild_id=1, creator_id=1, brief="Laundry bonanza", description=None,
+            expires_at=m.to_iso(now + dt.timedelta(hours=6)), points_each=1,
+            max_scorers=None, now=now,
+        )
+        mid = msg.id
+        await bot.on_raw_reaction_add(FakePayload(mid, "✅", user_id=42, member=FakeMember(42, "Pat")))
+        ch.msgs[mid].reactions.add("😄")  # a family member piles on for fun
+        await bot.on_raw_reaction_add(
+            FakePayload(mid, m.EMOJI_END, user_id=1, member=FakeMember(1, "Boss"))
+        )
+        react = ch.msgs[mid].reactions
+        assert "😄" in react, "a fun reaction must survive the close"
+        assert "✅" not in react and m.EMOJI_END not in react, "our buttons are taken down"
+        assert mid not in ch.cleared, "we never nuke every reaction anymore"
+
+
+async def test_nag_tally() -> None:
+    """Every nag bumps a lifetime nag_count that survives completion, keeps
+    accumulating across occurrences, and surfaces in /listtasks."""
+    with tempfile.TemporaryDirectory() as d:
+        bot, st, ch = await _game_setup(d)
+        tz = ZoneInfo("Europe/Berlin")
+        now = m.now_utc()
+        tod = now.astimezone(tz).strftime("%H:%M")
+        cfg = {"channel_id": 999, "timezone": "Europe/Berlin", "reminder_role_id": None}
+        tid = "feed"
+        async with st.txn() as data:
+            data["tasks"][tid] = {
+                "id": tid, "guild_id": 1, "brief": "Feed the goats", "description": None,
+                "recurring": True, "freq": "days", "interval_days": 1, "weekdays": [],
+                "monthdays": [], "time_of_day": tod,
+                "next_due": m.to_iso(now - dt.timedelta(seconds=1)),
+                "created_by": 1, "created_at": m.to_iso(now), "pending": None,
+            }
+
+        await bot.fire_task(tid, ch, cfg)
+        for _ in range(2):  # force two nags
+            async with st.txn() as data:
+                data["tasks"][tid]["pending"]["remind_at"] = m.to_iso(now - dt.timedelta(seconds=1))
+            await bot.send_reminder(tid, ch, cfg)
+        assert (await st.snapshot())["tasks"][tid]["nag_count"] == 2
+
+        # Completing the occurrence must NOT reset the lifetime tally.
+        posted = (await st.snapshot())["tasks"][tid]["pending"]["message_ids"][0]
+        await bot.on_raw_reaction_add(FakePayload(posted, "✅", member=FakeMember(42, "Pat")))
+        snap = await st.snapshot()
+        assert snap["tasks"][tid]["pending"] is None
+        assert snap["tasks"][tid]["nag_count"] == 2, "nag tally persists past completion"
+
+        # A nag on the NEXT occurrence keeps accumulating.
+        async with st.txn() as data:
+            data["tasks"][tid]["next_due"] = m.to_iso(now - dt.timedelta(seconds=1))
+        await bot.fire_task(tid, ch, cfg)
+        async with st.txn() as data:
+            data["tasks"][tid]["pending"]["remind_at"] = m.to_iso(now - dt.timedelta(seconds=1))
+        await bot.send_reminder(tid, ch, cfg)
+        assert (await st.snapshot())["tasks"][tid]["nag_count"] == 3
+
+        inter = FakeInteraction(guild_id=1, user=FakeUser(1, "Boss"))
+        await bot.listtasks.callback(inter)
+        assert "🔔×3" in inter.response.content, "/listtasks shows the lifetime nag count"
+
+
+async def test_listopen() -> None:
+    """/listopen lists open chores + live games, each linking to the ORIGINAL post
+    (never a nag), posts publicly, and says so when nothing is open."""
+    with tempfile.TemporaryDirectory() as d:
+        bot, st, ch = await _game_setup(d)
+        tz = ZoneInfo("Europe/Berlin")
+        now = m.now_utc()
+        tod = now.astimezone(tz).strftime("%H:%M")
+        cfg = {"channel_id": 999, "timezone": "Europe/Berlin", "reminder_role_id": None}
+
+        # Nothing open yet.
+        inter = FakeInteraction(guild_id=1, user=FakeUser(1, "Boss"))
+        await bot.listopen.callback(inter)
+        assert "caught up" in inter.response.content
+
+        # A recurring chore: fire it, then nag it so it has an original + a nag post.
+        tid = "water"
+        async with st.txn() as data:
+            data["tasks"][tid] = {
+                "id": tid, "guild_id": 1, "brief": "Fill animal water", "description": None,
+                "recurring": True, "freq": "days", "interval_days": 1, "weekdays": [],
+                "monthdays": [], "time_of_day": tod,
+                "next_due": m.to_iso(now - dt.timedelta(seconds=1)),
+                "created_by": 1, "created_at": m.to_iso(now), "pending": None,
+            }
+        await bot.fire_task(tid, ch, cfg)
+        orig = (await st.snapshot())["tasks"][tid]["pending"]["message_ids"][0]
+        async with st.txn() as data:
+            data["tasks"][tid]["pending"]["remind_at"] = m.to_iso(now - dt.timedelta(seconds=1))
+        await bot.send_reminder(tid, ch, cfg)
+        mids = (await st.snapshot())["tasks"][tid]["pending"]["message_ids"]
+        assert len(mids) == 2 and mids[0] == orig
+        nag = mids[1]
+
+        # And a live pitch-in.
+        pid, pmsg = await bot.post_pitchin(
+            ch, guild_id=1, creator_id=1, brief="Sweep the barn", description=None,
+            expires_at=m.to_iso(now + dt.timedelta(hours=6)), points_each=1,
+            max_scorers=None, now=now,
+        )
+
+        inter = FakeInteraction(guild_id=1, user=FakeUser(1, "Boss"))
+        await bot.listopen.callback(inter)
+        desc = inter.response.embed.description
+        assert "Fill animal water" in desc and "Sweep the barn" in desc
+        assert f"/{orig}" in desc, "links to the original post"
+        assert f"/{nag}" not in desc, "never links to a nag"
+        assert f"/{pmsg.id}" in desc, "the live pitch-in links to its own post"
+        assert not inter.response.ephemeral, "listopen posts publicly to the channel"
+
+
+async def test_listtasks_pagination() -> None:
+    """Many tasks paginate: /listtasks attaches a ◀/▶ pager whose buttons flip
+    pages, so every id stays reachable instead of being truncated away."""
+    with tempfile.TemporaryDirectory() as d:
+        bot, st, ch = await _game_setup(d)
+        now = m.now_utc()
+        async with st.txn() as data:
+            for i in range(40):
+                data["tasks"][f"t{i:02d}"] = {
+                    "id": f"t{i:02d}", "guild_id": 1,
+                    "brief": f"Chore number {i} on the farm", "description": None,
+                    "recurring": False, "freq": "once", "interval_days": 0,
+                    "weekdays": [], "monthdays": [], "time_of_day": None,
+                    "next_due": m.to_iso(now + dt.timedelta(hours=i + 1)),
+                    "created_by": 1, "created_at": m.to_iso(now), "pending": None,
+                }
+
+        inter = FakeInteraction(guild_id=1, user=FakeUser(1, "Boss"))
+        await bot.listtasks.callback(inter)
+        view = inter.response.view
+        assert isinstance(view, bot.ListPaginator), "many tasks -> a pager is attached"
+        assert "Page 1/" in inter.response.content
+        assert view.prev_btn.disabled and not view.next_btn.disabled, "start: ◀ off, ▶ on"
+
+        # Click ▶ to the last page; it should disable at the end.
+        guard = 0
+        i2 = inter
+        while view.index < len(view.pages) - 1 and guard < 50:
+            i2 = FakeInteraction(guild_id=1, user=FakeUser(1, "Boss"))
+            await view._go_next(i2)
+            guard += 1
+        assert view.index == len(view.pages) - 1
+        assert view.next_btn.disabled and not view.prev_btn.disabled, "end: ▶ off, ◀ on"
+        assert i2.response.content == view.pages[-1]
+
+        # Every id is reachable across the pages.
+        allpages = "\n".join(view.pages)
+        for i in range(40):
+            assert f"t{i:02d}" in allpages, f"id t{i:02d} must be reachable"
+
+
 def main() -> None:
     test_emoji_key()
     test_time_parsing()
@@ -1576,6 +1756,10 @@ def main() -> None:
     asyncio.run(test_void_completion())
     asyncio.run(test_bounty())
     asyncio.run(test_store())
+    asyncio.run(test_finalize_keeps_fun_reactions())
+    asyncio.run(test_nag_tally())
+    asyncio.run(test_listopen())
+    asyncio.run(test_listtasks_pagination())
     asyncio.run(test_lifecycle_and_snooze())
     asyncio.run(test_legacy_migration())
     asyncio.run(test_requeue())

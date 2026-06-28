@@ -52,7 +52,8 @@ the family chores.
 | `/doemup` | anyone | Post a **do-em-up**: `brief`, optional `points` per ➕ (default 1), `deadline`, `point_limit`, `description`. Tap ➕ once per thing you did; the tally updates live. See [Pitch-ins & do-em-ups](#pitch-ins--do-em-ups). |
 | `/edittask` | anyone | Change a task's `brief`, `at`, `repeat`, `description` (or `clear_description`), or `bounty`. Pick the task from autocomplete or paste its `id` from `/listtasks`. |
 | `/deletetask` | anyone | Permanently delete a task (autocompletes existing tasks). |
-| `/listtasks` | anyone | List all tasks with their **`id`**, schedule, and when each next posts. |
+| `/listtasks` | anyone | List all tasks with their **`id`**, schedule, and when each next posts — **paged** with ◀/▶ buttons so every id stays reachable, and showing 🔔×_n_, the lifetime number of times each chore has had to be nagged. |
+| `/listopen` | anyone | Post a public checklist of everything **open right now** — pending chores plus live pitch-ins / do-em-ups — each an **inline jump link** to the original post where it's done (never a nag), grouped and ordered by when it's due. Cuts the scrollback when lots are doable any time of day. |
 | `/leaderboard` | anyone | Monthly **points** per person — one per chore, **two** per bounty, plus pitch-in / do-em-up points — with each past month's winner shown by their **⭐ stars**, and the month's bountiful **zone** (`month` defaults to current). |
 | `/vitrine` | anyone | Gaze upon a collection of **trinkets** — the inert *objets d'art* earned at each month's end, one per whole multiple of the bar cleared, grouped by month. `user` defaults to yourself. |
 | `/farmhelp` | anyone | Quick reference for the commands, the `at`/`repeat` syntax, and the reactions. |
@@ -287,6 +288,9 @@ farmtracker/
   reminder is **live right now**, in which case that occurrence is left alone and
   the new schedule takes effect from the next cycle.
 - Reaction tidying (removing a clicker's ⏩/ℹ️ tap so it can be pressed again, and
-  clearing reactions on completed/undone tasks) needs **Manage Messages**; without
-  it the bot still works (it can always remove its own ↩️ and delete its own
-  snooze panels), it just leaves other reactions in place.
+  taking the bot's buttons off completed/undone tasks) needs **Manage Messages**;
+  without it the bot still works (it can always remove its own ↩️ and delete its
+  own snooze panels), it just leaves other reactions in place.
+- When an occurrence or pitch-in **closes**, only the bot's own functional buttons
+  (✅ ⏩ ℹ️ ❌ 🏁) are taken down — any reaction a family member piled on for fun (a
+  😄, a 🎉) is deliberately left in place rather than swept away.
