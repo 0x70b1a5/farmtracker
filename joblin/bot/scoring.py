@@ -167,9 +167,9 @@ async def leaderboard(interaction: discord.Interaction, month: Optional[str] = N
     await interaction.response.send_message(msg, ephemeral=empty, allowed_mentions=NO_PINGS)
 
 
-@bot.tree.command(name="vitrine", description="Gaze upon a collection of trinkets won at month's end")
+@bot.tree.command(name="covet", description="Gaze upon a collection of trinkets won at month's end")
 @app_commands.describe(user="Whose vitrine to view (default: yours)")
-async def vitrine(interaction: discord.Interaction, user: Optional[discord.Member] = None) -> None:
+async def covet(interaction: discord.Interaction, user: Optional[discord.Member] = None) -> None:
     target = user or interaction.user
     snap = await store.snapshot()
     cfg = guild_config(snap, interaction.guild_id)
@@ -245,7 +245,7 @@ __all__ = [
     "build_leaderboard",
     "leaderboard",
     "monthly_scores",
+    "covet",
     "star_counts",
-    "vitrine",
     "vitrine_for",
 ]

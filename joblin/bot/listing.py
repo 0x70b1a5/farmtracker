@@ -321,7 +321,7 @@ async def joblinhelp(interaction: discord.Interaction) -> None:
             "• `/edit` — change a task, pitch-in, or do-em-up (`/edit task|pitchin|doemup`)\n"
             "• `/deletetask` — remove a chore for good\n"
             "• `/leaderboard` — monthly puntos ranking & ⭐ stars 🏆\n"
-            "• `/vitrine` — your cabinet of month's-end trinkets 🖼️\n"
+            "• `/covet` — your cabinet of month's-end trinkets 🖼️\n"
             "• `/joblinconfig` — channel, timezone, reminder role, trinket bar *(Manage Server)*\n"
             "• `/joblinhelp` — this message"
         ),
@@ -397,7 +397,7 @@ async def joblinhelp(interaction: discord.Interaction) -> None:
         value=(
             "Clear the month's **bar** of puntos (default **25**, set with "
             "`/joblinconfig item_bar:`) and when the month closes an inert **trinket** "
-            "— a rolled *objet d'art* — lands in your `/vitrine`; clear it several "
+            "— a rolled *objet d'art* — lands in your `/covet`; clear it several "
             "times over (50 puntos on a 25-punto bar) and you collect that many. Each "
             "month a different **zone** is *in season* (the Bean Zone, the Vaults, the "
             "Menagerie…), shown on the `/leaderboard`: ~7 in 10 of your trinkets are "
