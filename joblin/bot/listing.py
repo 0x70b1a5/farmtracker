@@ -396,7 +396,8 @@ async def joblinhelp(interaction: discord.Interaction) -> None:
         name="🖼️ Trinkets & the vitrine",
         value=(
             "Clear the month's **bar** of puntos (default **25**, set with "
-            "`/joblinconfig item_bar:`) and when the month closes an inert **trinket** "
+            "`/joblinconfig item_bar:`; closed months keep the bar they ended under) "
+            "and when the month closes an inert **trinket** "
             "— a rolled *objet d'art* — lands in your `/covet`; clear it several "
             "times over (50 puntos on a 25-punto bar) and you collect that many. Each "
             "month a different **zone** is *in season* (the Bean Zone, the Vaults, the "

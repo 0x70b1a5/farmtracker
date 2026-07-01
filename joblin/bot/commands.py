@@ -39,6 +39,7 @@ from .helpers import (
     guild_config,
     schedule_label,
 )
+from .scoring import record_bar_change
 from .games import (
     _game_next_round,
     make_doemup_view,
@@ -147,7 +148,7 @@ async def joblinconfig(
         if reminder_role is not None:
             cfg["reminder_role_id"] = reminder_role.id
         if item_bar is not None:
-            cfg["item_bar"] = item_bar
+            record_bar_change(cfg, item_bar, now_utc())
         current = dict(cfg)
 
     ch = f"<#{current['channel_id']}>" if current.get("channel_id") else "— *(unset)*"
@@ -161,6 +162,8 @@ async def joblinconfig(
         f"• Reminder role: {role}\n"
         f"• Trinket bar: **{bar} puntos** each — every multiple earns another 🖼️"
     )
+    if item_bar is not None:
+        msg += "\n  ↳ _counts for the month underway and onward; closed months keep the bar they ended under._"
     if not config_ready(current):
         msg += "\n\n⚠️ Set **both** a channel and a timezone before creating tasks."
     await interaction.response.send_message(msg, ephemeral=True, allowed_mentions=NO_PINGS)

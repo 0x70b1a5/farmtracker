@@ -5,7 +5,9 @@ The deal
 At the close of each month, a worker earns one inert, decorative **trinket** for
 *every whole multiple* of the guild's **bar** (``/joblinconfig item_bar``, default
 :data:`DEFAULT_BAR`) their monthly puntos reached — clear it once for one, twice
-over (50 puntos against a 25-punto bar) for two. Each trinket draws its own
+over (50 puntos against a 25-punto bar) for two. A month is judged by the bar in
+force when it *closed* (``bot.bar_for``): re-barring the guild later never redraws
+a finished month. Each trinket draws its own
 **zone**: the month's featured ("in-season") zone is favoured (~70%), but the odd
 one strays in from another — a rotating *bonus*, not a monopoly. A trinket has no
 mechanical effect and costs no puntos; it is a milestone reward sitting *beside*
@@ -23,7 +25,7 @@ idx)`` — facts already pinned in the ledger — so :func:`roll_for` returns th
 *same* trinket every single time, on every machine, across restarts. That buys us
 the star's elegance with none of its hazards: no month-close job, no persisted
 award state, no double-award races. A whole vitrine is a pure function of
-``(completion log, bar, the zone schedule)``.
+``(completion log, bar history, the zone schedule)``.
 
 Two warnings live in the seeding:
 

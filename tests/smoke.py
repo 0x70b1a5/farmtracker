@@ -1549,22 +1549,22 @@ def test_vitrine_award() -> None:
         {"guild_id": 1, "user_id": 5, "user_name": "A", "month": "2026-03"},               # current
     ]
     # bar=3, "current" month = 2026-03: only user 5's closed 2026-01 qualifies.
-    won = B.vitrine_for(recs, 1, 5, 3, "2026-03")
+    won = B.vitrine_for(recs, 1, 5, {"item_bar": 3}, "2026-03")
     assert [t["month"] for t in won] == ["2026-01"], "award only past months >= bar"
-    assert B.vitrine_for(recs, 1, 9, 3, "2026-03") == [], "below the bar earns nothing"
+    assert B.vitrine_for(recs, 1, 9, {"item_bar": 3}, "2026-03") == [], "below the bar earns nothing"
     # The current (still-contested) month is never awarded yet.
-    assert all(t["month"] != "2026-03" for t in B.vitrine_for(recs, 1, 5, 1, "2026-03"))
+    assert all(t["month"] != "2026-03" for t in B.vitrine_for(recs, 1, 5, {"item_bar": 1}, "2026-03"))
     # And it's stable across calls (derived, not re-randomised each time).
-    assert won[0]["display"] == B.vitrine_for(recs, 1, 5, 3, "2026-03")[0]["display"]
+    assert won[0]["display"] == B.vitrine_for(recs, 1, 5, {"item_bar": 3}, "2026-03")[0]["display"]
 
     # Multiples: each whole multiple of the bar earns another trinket from that
     # month. User 5 cleared 3 puntos in 2026-01 → three at a 1-punto bar (idx 0,1,2),
     # one at a 2-punto bar (floor(3/2)), zero once the bar exceeds the score.
-    many = B.vitrine_for(recs, 1, 5, 1, "2026-03")
+    many = B.vitrine_for(recs, 1, 5, {"item_bar": 1}, "2026-03")
     assert [t["month"] for t in many] == ["2026-01"] * 3, "3 puntos / 1-punto bar → 3 trinkets"
     assert [t["idx"] for t in many] == [0, 1, 2], "indexed 0,1,2 within the month"
-    assert len(B.vitrine_for(recs, 1, 5, 2, "2026-03")) == 1, "floor(3/2) = 1"
-    assert B.vitrine_for(recs, 1, 5, 4, "2026-03") == [], "3 puntos under a 4-punto bar earns none"
+    assert len(B.vitrine_for(recs, 1, 5, {"item_bar": 2}, "2026-03")) == 1, "floor(3/2) = 1"
+    assert B.vitrine_for(recs, 1, 5, {"item_bar": 4}, "2026-03") == [], "3 puntos under a 4-punto bar earns none"
 
     # Each trinket is deterministic and wears the zone its own weighted draw chose
     # (the 70/30 bonus — see test_zone_pick), extras included, stable across calls.
@@ -1572,6 +1572,99 @@ def test_vitrine_award() -> None:
     for t in many:
         zk, in_season = T.zone_pick_for(1, 5, "2026-01", t["idx"])
         assert t["zone_key"] == zk and t["in_season"] == in_season, "trinket wears its picked zone"
+
+
+def test_bar_for_history() -> None:
+    """bar_for: a month is governed by the last bar change made before its
+    guild-local close; a still-open month floats with the latest change —
+    whatever is in force when the month ends is what freezes."""
+    import joblin.bot as B
+    from joblin import trinkets as T
+
+    # Legacy configs (no history) read as the scalar having been in force forever.
+    assert B.bar_for({"item_bar": 40}, "2020-01") == 40
+    assert B.bar_for({}, "2026-01") == T.DEFAULT_BAR
+    assert B.bar_for(None, "2026-01") == T.DEFAULT_BAR
+
+    cfg = {"timezone": "Europe/Berlin", "item_bar": 50,
+           "bar_history": [{"at": "1970-01-01T00:00:00+00:00", "bar": 25},
+                           {"at": "2026-08-15T12:00:00+00:00", "bar": 50}]}
+    assert B.bar_for(cfg, "2026-07") == 25, "July closed before the change — frozen"
+    assert B.bar_for(cfg, "2026-08") == 50, "August was still open, so it floats"
+    assert B.bar_for(cfg, "2026-09") == 50, "and 50 is what August's close froze"
+
+    # The close is guild-local: 22:30 UTC on July 31st is already August 1st in
+    # Berlin (July closed at 22:00 UTC), so the change misses July…
+    cfg["bar_history"][1]["at"] = "2026-07-31T22:30:00+00:00"
+    assert B.bar_for(cfg, "2026-07") == 25
+    assert B.bar_for(cfg, "2026-08") == 50
+    # …but 21:30 UTC is 23:30 Berlin — still July, so the change lands in it.
+    cfg["bar_history"][1]["at"] = "2026-07-31T21:30:00+00:00"
+    assert B.bar_for(cfg, "2026-07") == 50
+
+    # Several changes within one month: the last one standing at close wins.
+    cfg["bar_history"] = [{"at": "1970-01-01T00:00:00+00:00", "bar": 25},
+                          {"at": "2026-08-10T00:00:00+00:00", "bar": 100},
+                          {"at": "2026-08-20T00:00:00+00:00", "bar": 10}]
+    assert B.bar_for(cfg, "2026-08") == 10
+
+    # Mangled events are skipped; a junk month string reads as still open.
+    cfg["bar_history"].append({"at": "not-a-date", "bar": 7})
+    assert B.bar_for(cfg, "2026-08") == 10
+    assert B.bar_for(cfg, "garbage") == 10
+
+
+def test_vitrine_frozen_bars() -> None:
+    """Each month's trinkets are judged against the bar it closed under —
+    changing the bar later never redraws a finished month."""
+    import joblin.bot as B
+
+    recs = [
+        {"guild_id": 1, "user_id": 5, "user_name": "A", "month": "2026-01", "points": 2},
+        {"guild_id": 1, "user_id": 5, "user_name": "A", "month": "2026-01"},               # 3 total
+        {"guild_id": 1, "user_id": 5, "user_name": "A", "month": "2026-02", "points": 2},
+        {"guild_id": 1, "user_id": 5, "user_name": "A", "month": "2026-02", "points": 2},  # 4 total
+    ]
+    cfg = {"item_bar": 2,
+           "bar_history": [{"at": "1970-01-01T00:00:00+00:00", "bar": 3},
+                           {"at": "2026-02-10T00:00:00+00:00", "bar": 2}]}
+    won = B.vitrine_for(recs, 1, 5, cfg, "2026-03")
+    # January closed under bar 3 → 3//3 = 1; February under bar 2 → 4//2 = 2.
+    assert [t["month"] for t in won] == ["2026-01", "2026-02", "2026-02"]
+
+    # Raising the bar afterwards (in March) leaves both closed months alone.
+    cfg["bar_history"].append({"at": "2026-03-05T00:00:00+00:00", "bar": 100})
+    cfg["item_bar"] = 100
+    assert B.vitrine_for(recs, 1, 5, cfg, "2026-03") == won
+
+
+def test_record_bar_change() -> None:
+    """record_bar_change seeds the history with the pre-change bar (back-dated
+    to the epoch) so already-closed months keep reading the bar they ended
+    under, then appends the new value and mirrors it into item_bar."""
+    import datetime as dt
+
+    import joblin.bot as B
+    from joblin import trinkets as T
+
+    now = dt.datetime(2026, 8, 15, 12, 0, tzinfo=dt.timezone.utc)
+    cfg = {"item_bar": 25}
+    B.record_bar_change(cfg, 50, now)
+    assert cfg["item_bar"] == 50
+    assert [ev["bar"] for ev in cfg["bar_history"]] == [25, 50]
+    assert cfg["bar_history"][0]["at"].startswith("1970-"), "seeded old bar at the epoch"
+    assert B.bar_for(cfg, "2026-07") == 25, "months closed pre-change keep the old bar"
+    assert B.bar_for(cfg, "2026-08") == 50
+
+    B.record_bar_change(cfg, 50, now)  # a no-op "change" appends nothing
+    assert [ev["bar"] for ev in cfg["bar_history"]] == [25, 50]
+    B.record_bar_change(cfg, 30, dt.datetime(2026, 9, 1, tzinfo=dt.timezone.utc))
+    assert [ev["bar"] for ev in cfg["bar_history"]] == [25, 50, 30]
+
+    fresh: dict = {}  # a config that never had a bar seeds from the default
+    B.record_bar_change(fresh, 10, now)
+    assert [ev["bar"] for ev in fresh["bar_history"]] == [T.DEFAULT_BAR, 10]
+    assert fresh["item_bar"] == 10
 
 
 def test_zone_pick() -> None:
@@ -1953,6 +2046,9 @@ def main() -> None:
     test_trinkets()
     test_zone_pick()
     test_vitrine_award()
+    test_bar_for_history()
+    test_vitrine_frozen_bars()
+    test_record_bar_change()
     test_leaderboard_text()
     asyncio.run(test_daily_backup())
     asyncio.run(test_void_completion())

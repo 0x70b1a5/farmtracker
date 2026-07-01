@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import datetime as dt
 import itertools
 from typing import Optional
 from zoneinfo import ZoneInfo
@@ -10,7 +11,9 @@ from discord import app_commands
 from .. import trinkets
 from ..models import (
     UTC,
+    from_iso,
     now_utc,
+    to_iso,
 )
 from .core import (
     NO_PINGS,
@@ -79,11 +82,79 @@ def _guild_bar(cfg: Optional[dict]) -> int:
         return trinkets.DEFAULT_BAR
 
 
-def vitrine_for(records: list[dict], guild_id: int, user_id: int, bar: int,
+# ---------------------------------------------------------------------------
+# The bar is a value with a history, so closed months stay closed
+# ---------------------------------------------------------------------------
+_BAR_EPOCH = "1970-01-01T00:00:00+00:00"
+
+
+def _bar_history(cfg: Optional[dict]) -> list[tuple[dt.datetime, int]]:
+    """The guild's bar-change events as chronological ``(instant, bar)`` pairs.
+
+    A config that predates ``bar_history`` reads as its scalar ``item_bar``
+    having been in force forever — reinterpreted like legacy task rules, so
+    nothing on disk needs migrating."""
+    events: list[tuple[dt.datetime, int]] = []
+    for ev in (cfg or {}).get("bar_history") or []:
+        try:
+            events.append((from_iso(ev["at"]), max(1, int(ev["bar"]))))
+        except (KeyError, TypeError, ValueError):
+            continue  # skip a mangled event rather than dropping the vitrine
+    events.sort(key=lambda pair: pair[0])
+    return events or [(from_iso(_BAR_EPOCH), _guild_bar(cfg))]
+
+
+def _month_close_utc(month: str, tz: ZoneInfo) -> dt.datetime:
+    """The UTC instant a ``YYYY-MM`` guild-local month ends (the following
+    month's first local midnight)."""
+    y, m = int(month[:4]), int(month[5:7])
+    y, m = (y + 1, 1) if m == 12 else (y, m + 1)
+    return dt.datetime(y, m, 1, tzinfo=tz).astimezone(UTC)
+
+
+def bar_for(cfg: Optional[dict], month: str) -> int:
+    """The trinket bar governing ``month``: the last change made before the
+    month's guild-local close. A still-open month has no close behind it, so
+    every change qualifies and it floats with the latest bar — whatever is in
+    force when the month ends is what freezes. Changing the bar therefore
+    never redraws a finished month's trinkets."""
+    tz = ZoneInfo(cfg["timezone"]) if cfg and cfg.get("timezone") else UTC
+    try:
+        close = _month_close_utc(month, tz)
+    except (TypeError, ValueError):  # user-typed junk month — read it as open
+        close = None
+    history = _bar_history(cfg)
+    bar = history[0][1]  # a month closed before any recorded change reads the earliest
+    for at, b in history:
+        if close is None or at < close:
+            bar = b
+    return bar
+
+
+def record_bar_change(cfg: dict, new_bar: int, now: dt.datetime) -> None:
+    """Append a bar change to ``cfg`` (pure dict mutation; call inside a txn).
+
+    The first change seeds the history with the pre-change bar back-dated to
+    the epoch, so months that closed before anyone touched the bar keep the
+    bar they actually ended under. ``item_bar`` stays the current-value
+    mirror (display, and the legacy fallback in ``_bar_history``)."""
+    new_bar = max(1, int(new_bar))
+    history = cfg.get("bar_history")
+    if not isinstance(history, list):
+        history = cfg["bar_history"] = []
+    if not history:
+        history.append({"at": _BAR_EPOCH, "bar": _guild_bar(cfg)})
+    if history[-1].get("bar") != new_bar:  # a no-op "change" would only clutter
+        history.append({"at": to_iso(now), "bar": new_bar})
+    cfg["item_bar"] = new_bar
+
+
+def vitrine_for(records: list[dict], guild_id: int, user_id: int, cfg: Optional[dict],
                 current_month: str) -> list[dict]:
     """Every trinket a user has earned: one deterministic roll per *whole multiple*
-    of ``bar`` their puntos reached, for each *past* month (50 puntos against a
-    25-punto bar → two). Like stars, it's derived from the log — the current
+    of the bar their puntos reached, for each *past* month (50 puntos against a
+    25-punto bar → two) — each month judged against the bar it closed under
+    (:func:`bar_for`). Like stars, it's derived from the log — the current
     month is still in play, so it's excluded. Sorted oldest→newest, idx 0…n−1
     within a month."""
     out: list[dict] = []
@@ -93,7 +164,7 @@ def vitrine_for(records: list[dict], guild_id: int, user_id: int, bar: int,
         ent = bucket.get(user_id)
         if not ent:
             continue
-        for idx in range(ent["points"] // bar):  # bar ≥ 1, guaranteed by _guild_bar
+        for idx in range(ent["points"] // bar_for(cfg, month)):  # bar ≥ 1, guaranteed
             out.append(trinkets.roll_for(guild_id, user_id, month, idx))
     return out
 
@@ -108,9 +179,9 @@ def build_leaderboard(records: list[dict], guild_id: int, cfg: Optional[dict],
     and the nightly auto-post in ``backup.py``."""
     tz = ZoneInfo(cfg["timezone"]) if cfg and cfg.get("timezone") else UTC
     current_month = now_utc().astimezone(tz).strftime("%Y-%m")
-    bar = _guild_bar(cfg)
     if month is None:
         month = current_month
+    bar = bar_for(cfg, month)  # a past month shows the bar it closed under
 
     months = monthly_scores(records, guild_id)
     stars = star_counts(records, guild_id, current_month)
@@ -175,10 +246,10 @@ async def covet(interaction: discord.Interaction, user: Optional[discord.Member]
     cfg = guild_config(snap, interaction.guild_id)
     tz = ZoneInfo(cfg["timezone"]) if cfg and cfg.get("timezone") else UTC
     current_month = now_utc().astimezone(tz).strftime("%Y-%m")
-    bar = _guild_bar(cfg)
+    bar = bar_for(cfg, current_month)
 
     records = store.read_completions()
-    items = vitrine_for(records, interaction.guild_id, target.id, bar, current_month)
+    items = vitrine_for(records, interaction.guild_id, target.id, cfg, current_month)
 
     whose = "Your" if target.id == interaction.user.id else f"{target.display_name}'s"
     header = f"🖼️ **{whose} vitrine** — {len(items)} trinket{'' if len(items) == 1 else 's'}"
@@ -242,10 +313,12 @@ __all__ = [
     "_completion_points",
     "_guild_bar",
     "_rec_month",
+    "bar_for",
     "build_leaderboard",
     "leaderboard",
     "monthly_scores",
     "covet",
+    "record_bar_change",
     "star_counts",
     "vitrine_for",
 ]
